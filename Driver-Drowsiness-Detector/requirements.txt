@@ -1,0 +1,8 @@
+numpy
+scipy
+opencv-python<5
+imutils
+pygame
+# dlib needs CMake + a C++ compiler to build from source. If that fails, use the
+# prebuilt wheel instead:  pip install dlib-bin
+dlib
