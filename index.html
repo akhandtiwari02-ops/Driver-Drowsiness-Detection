@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver Drowsiness Detector</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --bad:#ef4444; --accent:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,Segoe UI,Arial,sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { margin:0 0 16px; color:var(--muted); font-size:.95rem; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  .banner { position:absolute; left:0; right:0; top:0; padding:14px; text-align:center; font-weight:700; font-size:1.5rem;
+            background:rgba(239,68,68,.85); color:#fff; display:none; }
+  .stage.alarm { outline:6px solid var(--bad); outline-offset:-6px; }
+  .stage.alarm .banner { display:block; }
+  .msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px; color:var(--muted); }
+  .row { display:flex; flex-wrap:wrap; gap:12px; margin-top:14px; align-items:center; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:1rem; cursor:pointer; }
+  button.stop { background:#475569; }
+  button:disabled { opacity:.5; cursor:default; }
+  .stat { background:var(--card); border-radius:10px; padding:10px 14px; min-width:120px; }
+  .stat b { display:block; font-size:1.3rem; }
+  .stat span { color:var(--muted); font-size:.8rem; }
+  .ctrl { background:var(--card); border-radius:10px; padding:12px 14px; margin-top:14px; }
+  .ctrl label { display:flex; justify-content:space-between; font-size:.9rem; margin-bottom:6px; }
+  input[type=range] { width:100%; }
+  small { color:var(--muted); display:block; margin-top:14px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Driver Drowsiness Detector</h1>
+  <p class="sub">Eye aspect ratio (EAR) runs live in your browser. Video never leaves your computer.</p>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="banner">You are Drowsy!</div>
+    <div class="msg" id="msg">Click "Start camera" and allow camera access.</div>
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start camera</button>
+    <button id="stopBtn" class="stop" disabled>Stop</button>
+    <div class="stat"><b id="earVal">-</b><span>Eye aspect ratio</span></div>
+    <div class="stat"><b id="closedVal">0.0 s</b><span>Eyes closed for</span></div>
+    <div class="stat"><b id="statusVal">Idle</b><span>Status</span></div>
+  </div>
+
+  <div class="ctrl">
+    <label><span>EAR threshold (eyes count as closed below this)</span><b id="thrOut">0.21</b></label>
+    <input type="range" id="thr" min="0.10" max="0.35" step="0.01" value="0.21">
+    <label style="margin-top:12px"><span>Seconds of closed eyes before alarm</span><b id="secOut">1.5</b></label>
+    <input type="range" id="sec" min="0.5" max="4" step="0.5" value="1.5">
+  </div>
+
+  <small>Tip: if the alarm never triggers when you close your eyes, raise the threshold a little. If it triggers while your eyes are open, lower it.
+  The first start downloads a small face model (about 4 MB), so it needs internet once.</small>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const stage = $("stage"), msg = $("msg");
+const startBtn = $("startBtn"), stopBtn = $("stopBtn");
+
+// MediaPipe face mesh landmark indexes: [outer corner, top1, top2, inner corner, bottom2, bottom1]
+const RIGHT_EYE = [33, 160, 158, 133, 153, 144];
+const LEFT_EYE  = [362, 385, 387, 263, 373, 380];
+
+let landmarker = null, stream = null, running = false;
+let closedSince = null, audioCtx = null, beepTimer = null, lastVideoTime = -1;
+
+$("thr").oninput = e => $("thrOut").textContent = (+e.target.value).toFixed(2);
+$("sec").oninput = e => $("secOut").textContent = (+e.target.value).toFixed(1);
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function ear(lm, idx, w, h) {
+  const p = idx.map(i => ({ x: lm[i].x * w, y: lm[i].y * h })); // pixel space so x and y are comparable
+  return (dist(p[1], p[5]) + dist(p[2], p[4])) / (2 * dist(p[0], p[3]));
+}
+
+function startAlarm() {
+  if (beepTimer || !audioCtx) return;
+  const beep = () => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = "square"; o.frequency.value = 880; g.gain.value = 0.15;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.25);
+  };
+  beep();
+  beepTimer = setInterval(beep, 500);
+}
+function stopAlarm() { clearInterval(beepTimer); beepTimer = null; }
+
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const base = { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" };
+  const opts = { runningMode: "VIDEO", numFaces: 1 };
+  try {
+    return await FaceLandmarker.createFromOptions(fileset, { ...opts, baseOptions: { ...base, delegate: "GPU" } });
+  } catch (e) {
+    return await FaceLandmarker.createFromOptions(fileset, { ...opts, baseOptions: { ...base, delegate: "CPU" } });
+  }
+}
+
+async function start() {
+  startBtn.disabled = true;
+  msg.style.display = "flex"; msg.textContent = "Loading face model...";
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    if (!landmarker) landmarker = await loadModel();
+    msg.textContent = "Requesting camera...";
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    msg.style.display = "none";
+    running = true; stopBtn.disabled = false; $("statusVal").textContent = "Watching";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    let text = "Could not start: " + err.message;
+    if (err.name === "NotAllowedError") text = "Camera blocked. Click the camera icon in the address bar and allow it, or enable camera access in Windows Settings > Privacy & security > Camera.";
+    if (err.name === "NotFoundError") text = "No camera found.";
+    if (err.name === "NotReadableError") text = "Camera is in use by another app (Zoom, Teams, Camera app). Close it and try again.";
+    msg.style.display = "flex"; msg.textContent = text;
+    startBtn.disabled = false;
+  }
+}
+
+function stop() {
+  running = false; stopAlarm(); closedSince = null;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  stage.classList.remove("alarm");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  startBtn.disabled = false; stopBtn.disabled = true;
+  $("statusVal").textContent = "Idle"; $("earVal").textContent = "-"; $("closedVal").textContent = "0.0 s";
+  msg.style.display = "flex"; msg.textContent = 'Click "Start camera" to begin.';
+}
+
+function drawEye(lm, idx, color) {
+  ctx.beginPath();
+  idx.forEach((i, k) => {
+    const x = lm[i].x * canvas.width, y = lm[i].y * canvas.height;
+    k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.closePath(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function loop() {
+  if (!running) return;
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const thr = +$("thr").value, limit = +$("sec").value;
+
+    if (res.faceLandmarks && res.faceLandmarks.length) {
+      const lm = res.faceLandmarks[0], w = canvas.width, h = canvas.height;
+      const e = (ear(lm, LEFT_EYE, w, h) + ear(lm, RIGHT_EYE, w, h)) / 2;
+      $("earVal").textContent = e.toFixed(2);
+
+      const closed = e < thr;
+      drawEye(lm, LEFT_EYE, closed ? "#ef4444" : "#22c55e");
+      drawEye(lm, RIGHT_EYE, closed ? "#ef4444" : "#22c55e");
+
+      if (closed) {
+        if (closedSince === null) closedSince = performance.now();
+        const secs = (performance.now() - closedSince) / 1000;
+        $("closedVal").textContent = secs.toFixed(1) + " s";
+        if (secs >= limit) {
+          stage.classList.add("alarm"); startAlarm(); $("statusVal").textContent = "DROWSY!";
+        } else $("statusVal").textContent = "Eyes closed";
+      } else {
+        closedSince = null; stopAlarm(); stage.classList.remove("alarm");
+        $("closedVal").textContent = "0.0 s"; $("statusVal").textContent = "Awake";
+      }
+    } else {
+      closedSince = null; stopAlarm(); stage.classList.remove("alarm");
+      $("earVal").textContent = "-"; $("closedVal").textContent = "0.0 s"; $("statusVal").textContent = "No face";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+</script>
+</body>
+</html>
